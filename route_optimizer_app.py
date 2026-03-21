@@ -36,12 +36,9 @@ st.set_page_config(
 # ═══════════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Nunito:wght@400;600;700;800&display=swap');
-
     .block-container { max-width: 1200px; }
 
     .main-title {
-        font-family: 'Nunito', sans-serif;
         font-weight: 800;
         font-size: 2.2rem;
         background: linear-gradient(135deg, #1a73e8 0%, #00bcd4 100%);
@@ -50,7 +47,6 @@ st.markdown("""
         margin-bottom: 0.2rem;
     }
     .sub-title {
-        font-family: 'Nunito', sans-serif;
         color: #666;
         font-size: 0.95rem;
         margin-bottom: 1.5rem;
@@ -64,31 +60,15 @@ st.markdown("""
         text-align: center;
     }
     .stat-card h3 {
-        font-family: 'JetBrains Mono', monospace;
+        font-family: monospace;
         font-size: 1.5rem;
         color: #1a73e8;
         margin: 0;
     }
     .stat-card p {
-        font-family: 'Nunito', sans-serif;
         color: #555;
         font-size: 0.8rem;
         margin: 0.2rem 0 0 0;
-    }
-
-    .status-ok {
-        color: #2e7d32;
-        background: #e8f5e9;
-        padding: 2px 10px;
-        border-radius: 6px;
-        font-weight: 600;
-    }
-    .status-fail {
-        color: #c62828;
-        background: #ffebee;
-        padding: 2px 10px;
-        border-radius: 6px;
-        font-weight: 600;
     }
 
     div[data-testid="stSidebar"] {
@@ -102,7 +82,7 @@ st.markdown("""
     }
 
     .log-box {
-        font-family: 'JetBrains Mono', monospace;
+        font-family: monospace;
         font-size: 0.75rem;
         background: #0d1117;
         color: #58a6ff;
@@ -111,6 +91,16 @@ st.markdown("""
         max-height: 400px;
         overflow-y: auto;
         line-height: 1.6;
+    }
+
+    .coord-info {
+        background: #e3f2fd;
+        border-left: 4px solid #1a73e8;
+        padding: 0.6rem 1rem;
+        border-radius: 0 8px 8px 0;
+        margin: 0.5rem 0;
+        font-family: monospace;
+        font-size: 0.85rem;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -841,10 +831,10 @@ def render_header():
 
 def render_sidebar():
     with st.sidebar:
-        st.markdown("### ⚙️ Параметри")
+        st.markdown("### Параметри")
         st.markdown("---")
 
-        st.markdown("**📊 Оптимізація**")
+        st.markdown("**Оптимізація**")
         tolerance = st.slider("TOLERANCE — допуск від плану",
                               0.01, 0.30, 0.10, 0.01,
                               help="±10% = діапазон допустимого кілометражу")
@@ -862,7 +852,7 @@ def render_sidebar():
                              help="Запас ітерацій для коригування км")
 
         st.markdown("---")
-        st.markdown("**🎯 Балансування**")
+        st.markdown("**Балансування**")
         coverage_bonus = st.slider("COVERAGE_BONUS — бонус за нові точки",
                                    1.0, 15.0, 3.0, 0.5,
                                    help="1.0=вимк., 3.0=помірний, 10+=агресивний")
@@ -874,7 +864,7 @@ def render_sidebar():
                                    help="0.0=завжди їздити, 0.6=до 60% без виїзду")
 
         st.markdown("---")
-        st.markdown("**🌐 OSRM API**")
+        st.markdown("**OSRM API**")
         osrm_url = st.text_input("OSRM URL",
                                   value="http://router.project-osrm.org",
                                   help="URL OSRM-сервера")
@@ -905,84 +895,151 @@ def render_sidebar():
 
 
 def render_map_editor(df_points):
-    """Render map for editing missing coordinates."""
+    """Render interactive map for viewing and editing coordinates."""
     import folium
     from streamlit_folium import st_folium
 
-    st.markdown("#### 🗺️ Координати точок")
+    # ── Edit controls above the map ──
+    st.markdown("#### Координати точок")
 
-    # Check for missing coords
     missing_point = df_points[df_points['Latitude'].isna() | df_points['Longitude'].isna()]
     missing_base = df_points[df_points['zero_Latitude'].isna() | df_points['zero_Longitude'].isna()]
-
     has_missing = len(missing_point) > 0 or len(missing_base) > 0
 
     if has_missing:
-        st.warning(f"⚠️ Відсутні координати: {len(missing_point)} точок, {len(missing_base)} баз")
+        st.warning(f"Відсутні координати: {len(missing_point)} точок, {len(missing_base)} баз. "
+                   "Оберіть що редагувати, клікніть на карті і натисніть «Застосувати».")
 
-    # Determine center
+    # Controls row
+    col_mode, col_track, col_target = st.columns([1, 1.5, 2.5])
+
+    with col_mode:
+        edit_mode = st.selectbox(
+            "Що редагувати",
+            ["Координати точки", "Координати бази"],
+            key="map_edit_mode"
+        )
+
+    tracks_list = df_points['track'].unique().tolist()
+    with col_track:
+        selected_track = st.selectbox("Трек", tracks_list, key="map_track")
+
+    with col_target:
+        if edit_mode == "Координати точки":
+            track_pts = df_points[df_points['track'] == selected_track]
+            point_options = []
+            for _, row in track_pts.iterrows():
+                name = str(row['FullName'])
+                has_coords = not pd.isna(row['Latitude']) and not pd.isna(row['Longitude'])
+                label = name if has_coords else f"[немає координат] {name}"
+                point_options.append(label)
+            selected_point_label = st.selectbox("Точка", point_options, key="map_point")
+            # Extract clean name
+            selected_point = selected_point_label.replace("[немає координат] ", "")
+        else:
+            zero_lat = df_points[df_points['track'] == selected_track].iloc[0].get('zero_Latitude')
+            zero_lon = df_points[df_points['track'] == selected_track].iloc[0].get('zero_Longitude')
+            if pd.isna(zero_lat) or pd.isna(zero_lon):
+                st.info("База не визначена — клікніть на карті")
+            else:
+                st.info(f"Поточна база: {zero_lat:.6f}, {zero_lon:.6f}")
+
+    # ── Build map ──
     valid_pts = df_points.dropna(subset=['Latitude', 'Longitude'])
     if len(valid_pts) > 0:
         center_lat = valid_pts['Latitude'].mean()
         center_lon = valid_pts['Longitude'].mean()
     else:
-        center_lat, center_lon = 49.0, 32.0  # Ukraine center
+        center_lat, center_lon = 49.0, 32.0
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=7,
                    tiles="CartoDB positron")
 
-    # Add existing points
-    for track in df_points['track'].unique():
+    # Color palette for tracks
+    track_colors = ["#1a73e8", "#e53935", "#43a047", "#fb8c00", "#8e24aa", "#00897b"]
+
+    for t_idx, track in enumerate(tracks_list):
         track_pts = df_points[df_points['track'] == track]
-        color = "blue" if track == df_points['track'].unique()[0] else "red"
+        color = track_colors[t_idx % len(track_colors)]
+        is_selected = (track == selected_track)
 
         # Base marker
-        zero_lat = track_pts.iloc[0].get('zero_Latitude')
-        zero_lon = track_pts.iloc[0].get('zero_Longitude')
-        if not pd.isna(zero_lat) and not pd.isna(zero_lon):
+        z_lat = track_pts.iloc[0].get('zero_Latitude')
+        z_lon = track_pts.iloc[0].get('zero_Longitude')
+        if not pd.isna(z_lat) and not pd.isna(z_lon):
             folium.Marker(
-                [zero_lat, zero_lon],
-                popup=f"🏠 База: {track[:25]}",
+                [z_lat, z_lon],
+                popup=f"<b>База:</b> {track[:30]}",
+                tooltip=f"База: {track[:25]}",
                 icon=folium.Icon(color="green", icon="home", prefix="fa"),
             ).add_to(m)
 
+        # Point markers
         for _, row in track_pts.iterrows():
             if pd.isna(row['Latitude']) or pd.isna(row['Longitude']):
                 continue
+            name = str(row['FullName'])
+            radius = 7 if is_selected else 4
+            opacity = 0.9 if is_selected else 0.4
             folium.CircleMarker(
                 [row['Latitude'], row['Longitude']],
-                radius=5, color=color, fill=True, fill_opacity=0.7,
-                popup=f"{row['FullName'][:40]}",
+                radius=radius,
+                color=color,
+                fill=True,
+                fill_color=color,
+                fill_opacity=opacity,
+                popup=f"<b>{name[:50]}</b><br>{row['Latitude']:.6f}, {row['Longitude']:.6f}",
+                tooltip=name[:35],
             ).add_to(m)
 
-    map_data = st_folium(m, width=None, height=420, returned_objects=["last_clicked"])
+    # ── Render map and capture clicks ──
+    map_data = st_folium(m, width=None, height=450, returned_objects=["last_clicked"])
 
-    # Handle clicks for missing coordinates
-    if has_missing and map_data and map_data.get("last_clicked"):
+    # ── Handle click ──
+    if map_data and map_data.get("last_clicked"):
         clicked = map_data["last_clicked"]
-        st.info(f"📍 Клік: {clicked['lat']:.6f}, {clicked['lng']:.6f}")
+        lat_c = round(clicked['lat'], 6)
+        lon_c = round(clicked['lng'], 6)
 
-        if len(missing_point) > 0:
-            st.markdown("**Призначити координати для точки:**")
-            options = missing_point['FullName'].tolist()
-            selected = st.selectbox("Оберіть точку", options, key="assign_point")
-            if st.button("✅ Призначити координати точки", key="btn_point"):
-                idx = df_points[df_points['FullName'] == selected].index
-                df_points.loc[idx, 'Latitude'] = clicked['lat']
-                df_points.loc[idx, 'Longitude'] = clicked['lng']
-                st.success(f"Координати призначено для: {selected[:40]}")
-                st.rerun()
+        st.markdown(
+            f'<div class="coord-info">Клік на карті: <b>{lat_c}</b>, <b>{lon_c}</b></div>',
+            unsafe_allow_html=True
+        )
 
-        if len(missing_base) > 0:
-            st.markdown("**Призначити координати для бази:**")
-            base_tracks = missing_base['track'].unique().tolist()
-            selected_track = st.selectbox("Оберіть трек", base_tracks, key="assign_base")
-            if st.button("✅ Призначити координати бази", key="btn_base"):
+        col_btn, col_desc = st.columns([1, 3])
+        with col_btn:
+            apply_clicked = st.button("Застосувати", type="primary",
+                                       use_container_width=True, key="btn_apply_coord")
+        with col_desc:
+            if edit_mode == "Координати точки":
+                st.caption(f"→ {selected_point[:60]} ({selected_track[:25]})")
+            else:
+                st.caption(f"→ База для {selected_track[:40]}")
+
+        if apply_clicked:
+            if edit_mode == "Координати точки":
+                idx = df_points[
+                    (df_points['track'] == selected_track) &
+                    (df_points['FullName'] == selected_point)
+                ].index
+                if len(idx) > 0:
+                    df_points.loc[idx, 'Latitude'] = lat_c
+                    df_points.loc[idx, 'Longitude'] = lon_c
+                    st.success(f"Координати оновлено: {selected_point[:50]}")
+                    st.rerun()
+                else:
+                    st.error("Точку не знайдено")
+            else:
                 idx = df_points[df_points['track'] == selected_track].index
-                df_points.loc[idx, 'zero_Latitude'] = clicked['lat']
-                df_points.loc[idx, 'zero_Longitude'] = clicked['lng']
-                st.success(f"Базу призначено для: {selected_track[:30]}")
-                st.rerun()
+                if len(idx) > 0:
+                    df_points.loc[idx, 'zero_Latitude'] = lat_c
+                    df_points.loc[idx, 'zero_Longitude'] = lon_c
+                    st.success(f"Базу оновлено для: {selected_track[:40]}")
+                    st.rerun()
+                else:
+                    st.error("Трек не знайдено")
+    else:
+        st.caption("Клікніть на карті щоб обрати координати")
 
     return df_points
 
@@ -1051,10 +1108,10 @@ def main():
 
     # Tabs for data preview
     tab_map, tab_pts, tab_dates, tab_plan = st.tabs([
-        "🗺️ Карта та координати",
-        "📍 Точки (sh1)",
-        "📅 Дати (sh2)",
-        "📊 План (sh3)"
+        "Карта та координати",
+        "Точки (sh1)",
+        "Дати (sh2)",
+        "План (sh3)"
     ])
 
     with tab_map:
