@@ -209,14 +209,18 @@ def get_distance(cache, lat1, lon1, lat2, lon2):
 # ═══════════════════════════════════════════════════════════════════
 def prefetch_distances(cache, df_points, df_dates, osrm_url, batch_size, api_delay,
                        max_workers, log_callback=None):
-    """Build distance cache for all needed point pairs using OSRM Table API."""
+    """Build distance cache per track using OSRM Table API.
+    Each track's coords (base + points) are batched together so that
+    all intra-track pairs are covered without cross-batch fallback."""
 
     def log(msg):
         if log_callback:
             log_callback(msg)
 
-    # Build needed pairs from points + dates
-    needed_pairs = set()
+    # ── 1. Build per-track coord lists ──
+    track_batches = []  # [(track_name, [coords_list]), ...]
+    total_pairs = 0
+    cached_pairs = 0
 
     for track in df_points['track'].unique():
         track_pts = df_points[df_points['track'] == track]
@@ -230,51 +234,43 @@ def prefetch_distances(cache, df_points, df_dates, osrm_url, batch_size, api_del
 
         base = (round(float(zero_lat), 6), round(float(zero_lon), 6))
 
-        # All unique point coords for this track
-        point_coords = []
+        point_coords = set()
         for _, row in track_pts.iterrows():
             if pd.isna(row['Latitude']) or pd.isna(row['Longitude']):
                 continue
-            point_coords.append((round(float(row['Latitude']), 6),
-                                 round(float(row['Longitude']), 6)))
+            point_coords.add((round(float(row['Latitude']), 6),
+                              round(float(row['Longitude']), 6)))
 
-        # Need base↔point and point↔point pairs
-        all_coords = [base] + list(set(point_coords))
-        for i, a in enumerate(all_coords):
-            for j, b in enumerate(all_coords):
-                if i != j:
-                    needed_pairs.add((a[0], a[1], b[0], b[1]))
+        all_coords = [base] + [c for c in point_coords if c != base]
+        n = len(all_coords)
+        if n < 2:
+            continue
 
-    # Filter: only missing from cache
-    missing = [p for p in needed_pairs if cache.get(*p) is None]
+        # Count pairs
+        n_pairs = n * (n - 1)
+        total_pairs += n_pairs
+        n_cached = sum(1 for i in range(n) for j in range(n)
+                       if i != j and cache.get(all_coords[i][0], all_coords[i][1],
+                                                all_coords[j][0], all_coords[j][1]) is not None)
+        cached_pairs += n_cached
 
-    log(f"Пар потрібно: {len(needed_pairs)} | В кеші: {len(needed_pairs) - len(missing)} | Нових: {len(missing)}")
+        if n_cached < n_pairs:
+            # Split into sub-batches if track has more coords than batch_size
+            for start in range(0, n, batch_size):
+                chunk = all_coords[start:start + batch_size]
+                if len(chunk) >= 2:
+                    track_batches.append((track, chunk))
 
-    if not missing:
+    missing_pairs = total_pairs - cached_pairs
+    log(f"Пар потрібно: {total_pairs} | В кеші: {cached_pairs} | Нових: {missing_pairs}")
+
+    if not track_batches:
         log("✅ Всі пари в кеші — API-запити не потрібні!")
         return
 
-    # Collect unique coords from missing pairs
-    new_coords = set()
-    for lat1, lon1, lat2, lon2 in missing:
-        new_coords.add((lat1, lon1))
-        new_coords.add((lat2, lon2))
+    log(f"Table API батчів: {len(track_batches)} (по-треково)")
 
-    new_coords_list = list(new_coords)
-    log(f"Унікальних координат для запиту: {len(new_coords_list)}")
-
-    # Build batches
-    batches = []
-    for i in range(0, len(new_coords_list), batch_size):
-        batch = new_coords_list[i:i + batch_size]
-        if len(batch) >= 2:
-            batches.append(batch)
-
-    if not batches and new_coords_list:
-        batches.append(new_coords_list)
-
-    log(f"Table API батчів: {len(batches)}")
-
+    # ── 2. Process batches via Table API ──
     def process_batch(batch_coords):
         osrm_coords = [(lon, lat) for lat, lon in batch_coords]
         matrix = osrm_table(osrm_coords, osrm_url)
@@ -289,6 +285,7 @@ def prefetch_distances(cache, df_points, df_dates, osrm_url, batch_size, api_del
                         items.append((round(lat1, 6), round(lon1, 6),
                                       round(lat2, 6), round(lon2, 6), dist))
         else:
+            # Haversine fallback for entire batch
             for i, (lat1, lon1) in enumerate(batch_coords):
                 for j, (lat2, lon2) in enumerate(batch_coords):
                     if i == j:
@@ -302,50 +299,17 @@ def prefetch_distances(cache, df_points, df_dates, osrm_url, batch_size, api_del
         return len(items)
 
     with ThreadPoolExecutor(max_workers=min(max_workers, 4)) as ex:
-        futs = {ex.submit(process_batch, b): idx for idx, b in enumerate(batches)}
+        futs = {ex.submit(process_batch, coords): name
+                for name, coords in track_batches}
         done = 0
         for f in as_completed(futs):
             done += 1
             try:
                 f.result()
-                if done % 3 == 0 or done == len(batches):
-                    log(f"  Table API: {done}/{len(batches)} (кеш: {len(cache)})")
+                if done % 5 == 0 or done == len(track_batches):
+                    log(f"  Table API: {done}/{len(track_batches)} (кеш: {len(cache)})")
             except Exception as e:
                 log(f"  ⚠ Помилка: {e}")
-
-    # Fallback for still-missing pairs via route API
-    still_missing = [p for p in missing if cache.get(*p) is None]
-    if still_missing:
-        log(f"Дозавантаження {len(still_missing)} пар (route API)...")
-        session = requests.Session()
-
-        def fetch_one(key):
-            lat1, lon1, lat2, lon2 = key
-            for attempt in range(3):
-                try:
-                    r = session.get(
-                        f"{osrm_url}/route/v1/driving/{lon1},{lat1};{lon2},{lat2}",
-                        params={"overview": "false"}, timeout=30)
-                    if r.status_code == 200:
-                        data = r.json()
-                        if data.get("code") == "Ok" and data.get("routes"):
-                            d = round(data["routes"][0]["distance"] / 1000, 2)
-                            cache.put_batch([(lat1, lon1, lat2, lon2, d)])
-                            return
-                    elif r.status_code == 429:
-                        time.sleep(2 ** attempt)
-                except Exception:
-                    time.sleep(0.5)
-            fb = round(haversine(lat1, lon1, lat2, lon2) * 1.3, 2)
-            cache.put_batch([(lat1, lon1, lat2, lon2, fb)])
-            time.sleep(api_delay)
-
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futs = [ex.submit(fetch_one, k) for k in still_missing]
-            for i, f in enumerate(as_completed(futs), 1):
-                f.result()
-                if i % 20 == 0 or i == len(still_missing):
-                    log(f"  route fallback: {i}/{len(still_missing)}")
 
     log(f"✅ Prefetch завершено. Кеш: {len(cache)} пар.")
 
@@ -944,53 +908,52 @@ def render_map_editor(df_points):
             else:
                 st.info(f"Поточна база: {zero_lat:.6f}, {zero_lon:.6f}")
 
-    # ── Build map ──
-    valid_pts = df_points.dropna(subset=['Latitude', 'Longitude'])
-    if len(valid_pts) > 0:
+    # ── Build map — only selected track ──
+    track_pts = df_points[df_points['track'] == selected_track]
+    valid_pts = track_pts.dropna(subset=['Latitude', 'Longitude'])
+
+    # Center on selected track
+    z_lat = track_pts.iloc[0].get('zero_Latitude') if len(track_pts) > 0 else None
+    z_lon = track_pts.iloc[0].get('zero_Longitude') if len(track_pts) > 0 else None
+
+    if not pd.isna(z_lat) and not pd.isna(z_lon):
+        center_lat, center_lon = float(z_lat), float(z_lon)
+        zoom = 10
+    elif len(valid_pts) > 0:
         center_lat = valid_pts['Latitude'].mean()
         center_lon = valid_pts['Longitude'].mean()
+        zoom = 10
     else:
         center_lat, center_lon = 49.0, 32.0
+        zoom = 6
 
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=7,
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom,
                    tiles="CartoDB positron")
 
-    # Color palette for tracks
-    track_colors = ["#1a73e8", "#e53935", "#43a047", "#fb8c00", "#8e24aa", "#00897b"]
+    # Base marker
+    if not pd.isna(z_lat) and not pd.isna(z_lon):
+        folium.Marker(
+            [z_lat, z_lon],
+            popup=f"<b>База:</b> {selected_track[:30]}",
+            tooltip=f"База: {selected_track[:25]}",
+            icon=folium.Icon(color="green", icon="home", prefix="fa"),
+        ).add_to(m)
 
-    for t_idx, track in enumerate(tracks_list):
-        track_pts = df_points[df_points['track'] == track]
-        color = track_colors[t_idx % len(track_colors)]
-        is_selected = (track == selected_track)
-
-        # Base marker
-        z_lat = track_pts.iloc[0].get('zero_Latitude')
-        z_lon = track_pts.iloc[0].get('zero_Longitude')
-        if not pd.isna(z_lat) and not pd.isna(z_lon):
-            folium.Marker(
-                [z_lat, z_lon],
-                popup=f"<b>База:</b> {track[:30]}",
-                tooltip=f"База: {track[:25]}",
-                icon=folium.Icon(color="green", icon="home", prefix="fa"),
-            ).add_to(m)
-
-        # Point markers
-        for _, row in track_pts.iterrows():
-            if pd.isna(row['Latitude']) or pd.isna(row['Longitude']):
-                continue
-            name = str(row['FullName'])
-            radius = 7 if is_selected else 4
-            opacity = 0.9 if is_selected else 0.4
-            folium.CircleMarker(
-                [row['Latitude'], row['Longitude']],
-                radius=radius,
-                color=color,
-                fill=True,
-                fill_color=color,
-                fill_opacity=opacity,
-                popup=f"<b>{name[:50]}</b><br>{row['Latitude']:.6f}, {row['Longitude']:.6f}",
-                tooltip=name[:35],
-            ).add_to(m)
+    # Point markers — only selected track
+    for _, row in track_pts.iterrows():
+        if pd.isna(row['Latitude']) or pd.isna(row['Longitude']):
+            continue
+        name = str(row['FullName'])
+        folium.CircleMarker(
+            [row['Latitude'], row['Longitude']],
+            radius=7,
+            color="#1a73e8",
+            fill=True,
+            fill_color="#1a73e8",
+            fill_opacity=0.85,
+            popup=f"<b>{name[:50]}</b><br>{row['Latitude']:.6f}, {row['Longitude']:.6f}",
+            tooltip=name[:35],
+        ).add_to(m)
 
     # ── Render map and capture clicks ──
     map_data = st_folium(m, width=None, height=450, returned_objects=["last_clicked"])
