@@ -510,27 +510,35 @@ def scored_fill(w_days, target_km, library, visited_global, params, seed=None):
     return day_plan, new_visited
 
 
-def build_rows(track, date, stop_names, base, coords, cache, zero_address, date_owner_map, addresses=None):
+def build_rows(track, date, stop_names, coords, cache, owner_bases, date_owner_map,
+               default_base, addresses=None):
     """Build output rows for one day.
-    
-    zero_address: string address of driver's home (replaces generic "база" label)
-    date_owner_map: dict {date -> OwnerName} for this track
-    addresses: dict {FullName -> address string} — appended after | in Точка column
+
+    owner_bases    — {OwnerName: (lat, lon, zero_adress_str)}
+    date_owner_map — {date -> OwnerName} for this track
+    default_base   — fallback (lat, lon) if owner not in owner_bases
+    addresses      — {FullName -> address_str} appended after | in Точка column
     """
     COL_TRACK = "Трек"
-    COL_DATE = "Дата"
+    COL_DATE  = "Дата"
     COL_OWNER = "OwnerName"
     COL_POINT = "Точка"
-    COL_KM = "Пробег_км"
-    COL_LAT = "Latitude"
-    COL_LON = "Longitude"
+    COL_KM    = "Пробег_км"
+    COL_LAT   = "Latitude"
+    COL_LON   = "Longitude"
 
     # Determine OwnerName for this date
     date_key = pd.Timestamp(date).date()
     owner = date_owner_map.get(date_key, "")
 
-    # Label for home/base — use zero_address if available
-    home_label = zero_address if zero_address and str(zero_address).strip() else "База"
+    # Resolve base coordinates and home label for this specific owner/day
+    if owner and owner in owner_bases:
+        b_lat, b_lon, zero_adress = owner_bases[owner]
+        base = (b_lat, b_lon)
+    else:
+        base = default_base
+        zero_adress = ""
+    home_label = zero_adress if zero_adress else "База"
 
     if not stop_names:
         return [{
@@ -566,11 +574,17 @@ def build_rows(track, date, stop_names, base, coords, cache, zero_address, date_
 
 
 def extract_pool(df_points_track):
-    """Extract base coordinates, zero_address, stop coords and address map from a track's points."""
-    base = None
-    zero_address = ""
+    """Extract stop coords, per-owner bases and address map from a track's points.
+
+    Returns:
+        coords       — {FullName: (lat, lon)}
+        default_base — centroid of all owner bases (used for build_library)
+        owner_bases  — {OwnerName: (lat, lon, zero_adress_str)}
+        addresses    — {FullName: address_str}
+    """
     coords = {}
-    addresses = {}  # {FullName: address string}
+    addresses = {}
+    owner_bases = {}  # {OwnerName: (lat, lon, adress_str)}
 
     for _, row in df_points_track.iterrows():
         lat, lon = row['Latitude'], row['Longitude']
@@ -578,28 +592,37 @@ def extract_pool(df_points_track):
             continue
         name = str(row['FullName']).strip()
         coords[name] = (float(lat), float(lon))
-        # address column for this point
-        addr = row.get('address', "")
-        if addr is not None and not (isinstance(addr, float) and math.isnan(addr)):
-            addresses[name] = str(addr).strip()
-        else:
-            addresses[name] = ""
+        addr = row.get('adress FullName', row.get('address', ""))
+        addresses[name] = (str(addr).strip()
+                           if addr is not None and not (isinstance(addr, float) and math.isnan(addr))
+                           else "")
 
-    zero_lat = df_points_track.iloc[0].get('zero_Latitude')
-    zero_lon = df_points_track.iloc[0].get('zero_Longitude')
-    if not pd.isna(zero_lat) and not pd.isna(zero_lon):
-        base = (float(zero_lat), float(zero_lon))
+    # Per-owner home base
+    if 'OwnerName' in df_points_track.columns:
+        for owner, grp in df_points_track.groupby('OwnerName'):
+            row0 = grp.iloc[0]
+            z_lat = row0.get('zero_Latitude')
+            z_lon = row0.get('zero_Longitude')
+            if z_lat is not None and z_lon is not None and not pd.isna(z_lat) and not pd.isna(z_lon):
+                za = row0.get('zero_adress', row0.get('zero_address', ""))
+                za_str = (str(za).strip()
+                          if za is not None and not (isinstance(za, float) and math.isnan(za))
+                          else "")
+                owner_bases[str(owner)] = (float(z_lat), float(z_lon), za_str)
+
+    # Default base — centroid of all owner bases (fallback: centroid of points)
+    if owner_bases:
+        lats = [v[0] for v in owner_bases.values()]
+        lons = [v[1] for v in owner_bases.values()]
+        default_base = (sum(lats) / len(lats), sum(lons) / len(lons))
     elif coords:
         lats = [v[0] for v in coords.values()]
         lons = [v[1] for v in coords.values()]
-        base = (sum(lats) / len(lats), sum(lons) / len(lons))
+        default_base = (sum(lats) / len(lats), sum(lons) / len(lons))
+    else:
+        default_base = None
 
-    # Extract zero_address (driver home address)
-    za = df_points_track.iloc[0].get('zero_address', "")
-    if za is not None and not (isinstance(za, float) and math.isnan(za)):
-        zero_address = str(za).strip()
-
-    return coords, base, zero_address, addresses
+    return coords, default_base, owner_bases, addresses
 
 
 def parse_period(period):
@@ -793,14 +816,18 @@ def run_optimization(df_points, df_dates, df_plan, params, log_callback=None):
             owner = str(row.get('OwnerName', "")).strip()
             date_owner_by_track.setdefault(track, {})[d] = owner
     
-    # Build odometr lookup from sh3: {track -> odometr value for last period}
+    # Build odometr lookup from sh3 — support both 'одометр' and 'odometr' column names
+    odo_col = None
+    for candidate in ['одометр', 'odometr']:
+        if candidate in df_plan.columns:
+            odo_col = candidate
+            break
     odometr_input = {}
-    if 'odometr' in df_plan.columns:
+    if odo_col:
         for _, row in df_plan.iterrows():
             track = str(row['Трек']).strip()
-            odo = row.get('odometr', None)
+            odo = row.get(odo_col, None)
             if odo is not None and not (isinstance(odo, float) and math.isnan(odo)):
-                # Keep only (store; we'll verify it's the last period after sorting)
                 odometr_input.setdefault(track, []).append((str(row['Період']).strip(), float(odo)))
 
     # Filter active plans
@@ -820,23 +847,23 @@ def run_optimization(df_points, df_dates, df_plan, params, log_callback=None):
             log("  ⚠ Немає точок — пропускаємо.")
             continue
 
-        coords, base, zero_address, addresses = extract_pool(track_pts)
-        if not coords or base is None:
+        coords, default_base, owner_bases, addresses = extract_pool(track_pts)
+        if not coords or default_base is None:
             log("  ⚠ Немає координат — пропускаємо.")
             continue
 
         log(f"  Пул точок: {len(coords)}")
-        log(f"  База: {base[0]:.4f}, {base[1]:.4f}")
-        if zero_address:
-            log(f"  Адреса водія: {zero_address}")
+        log(f"  База (центроїд): {default_base[0]:.4f}, {default_base[1]:.4f}")
+        for own, (blat, blon, baddr) in owner_bases.items():
+            log(f"  Водій: {own} | база: {blat:.4f},{blon:.4f} | адреса: {baddr}")
 
         # Date→owner map for this track
         date_owner_map = date_owner_by_track.get(track, {})
 
-        # Log unique owners for this track
+        # Unique owners driving this track
         unique_owners = list(set(date_owner_map.values()) - {""})
         if unique_owners:
-            log(f"  Водії: {', '.join(unique_owners)}")
+            log(f"  Активні водії в датах: {', '.join(unique_owners)}")
 
         # Get periods for this track
         track_plans = df_plan_active[df_plan_active['Трек'] == track]
@@ -873,7 +900,7 @@ def run_optimization(df_points, df_dates, df_plan, params, log_callback=None):
         months_info.sort(key=lambda x: (x[0], x[1]))
         log(f"  Місяців: {len(months_info)}, днів: {sum(len(m[3]) for m in months_info)}")
 
-        library = build_library(base, coords, cache,
+        library = build_library(default_base, coords, cache,
                                 params['max_stops'], params['n_samples'], params['seed'])
         log(f"  Бібліотека: {len(library)} маршрутів")
 
@@ -887,8 +914,17 @@ def run_optimization(df_points, df_dates, df_plan, params, log_callback=None):
                 w_days, target, library, visited_global, params
             )
 
-            fact_km = sum(calc_km(base, list(fs), coords, cache)
-                          for fs, _ in day_plan.values())
+            # fact_km: use each day's owner-specific base for accuracy
+            fact_km = 0.0
+            for day_ts, (fs, _) in day_plan.items():
+                day_key = pd.Timestamp(day_ts).date()
+                day_owner = date_owner_map.get(day_key, "")
+                if day_owner and day_owner in owner_bases:
+                    day_base = owner_bases[day_owner][:2]
+                else:
+                    day_base = default_base
+                fact_km += calc_km(day_base, list(fs), coords, cache)
+            fact_km = round(fact_km, 2)
             dev_pct = (fact_km - target) / target * 100
             status = "✓" if abs(dev_pct) <= params['tolerance'] * 100 else "✗"
             log(f"  Факт: {fact_km:.1f} км | Відхилення: {dev_pct:+.1f}% {status}")
@@ -904,8 +940,8 @@ def run_optimization(df_points, df_dates, df_plan, params, log_callback=None):
             for date in sorted(day_plan.keys()):
                 fs, _ = day_plan[date]
                 all_rows_out.extend(
-                    build_rows(track, pd.Timestamp(date), fs, base, coords, cache,
-                               zero_address, date_owner_map, addresses))
+                    build_rows(track, pd.Timestamp(date), fs, coords, cache,
+                               owner_bases, date_owner_map, default_base, addresses))
 
             row_entry = {
                 "track": track, "period": period,
@@ -1211,14 +1247,28 @@ def main():
         st.error(f"Помилка читання файлу: {e}")
         return
 
-    # Ensure new columns exist (backward compat — fill with empty if absent)
-    for col in ['address', 'zero_address']:
+    # Ensure new columns exist (backward compat)
+    for col in ['adress FullName', 'zero_adress']:
         if col not in df_points.columns:
             df_points[col] = ""
     if 'OwnerName' not in df_dates.columns:
         df_dates['OwnerName'] = ""
-    if 'odometr' not in df_plan.columns:
-        df_plan['odometr'] = None
+    odo_col_exists = 'одометр' in df_plan.columns or 'odometr' in df_plan.columns
+    if not odo_col_exists:
+        df_plan['одометр'] = None
+
+    # ── Derive `track` for sh1 from sh2 (OwnerName → track mapping) ──
+    # sh1 has no `track` column; each point belongs to all tracks the owner drives.
+    if 'track' not in df_points.columns:
+        owner_track_pairs = (df_dates[['OwnerName', 'track']]
+                             .dropna()
+                             .drop_duplicates())
+        # Expand: one row per (point × track) for owners that drive multiple tracks
+        df_points = df_points.merge(owner_track_pairs, on='OwnerName', how='left')
+        missing_track = df_points['track'].isna().sum()
+        if missing_track > 0:
+            st.warning(f"⚠️ {missing_track} точок не мають відповідного треку в sh2 — перевірте OwnerName.")
+            df_points = df_points.dropna(subset=['track'])
 
     if 'df_points' not in st.session_state or st.session_state.get('_file_id') != uploaded.name:
         st.session_state.df_points = df_points.copy()
@@ -1258,9 +1308,9 @@ def main():
     with tab_pts:
         st.markdown("#### Точки відвідування")
         # Show columns including new address fields
-        edit_cols = ['track', 'OwnerName', 'FullName', 'address',
+        edit_cols = ['track', 'OwnerName', 'FullName', 'adress FullName',
                      'Latitude', 'Longitude',
-                     'zero_Latitude', 'zero_Longitude', 'zero_address']
+                     'zero_Latitude', 'zero_Longitude', 'zero_adress']
         display_cols = [c for c in edit_cols if c in df_points.columns]
         edited_pts = st.data_editor(
             df_points[display_cols],
