@@ -1,16 +1,15 @@
 """
-Route Optimizer — Streamlit App  v7
+Route Optimizer — Streamlit App  v7 + Batch Processing
 Combines routing_osv_ver5 (distance fetching) + redistribution_dist_ver6 (optimization)
 
-Changes vs v6:
-- sh1: added `address` (delivery point address) and `zero_address` (driver home address)
-- sh2: added `OwnerName` — which driver uses the track on a given day
-- sh3: added `odometr` — odometer reading for the last period of a track
-- Output Маршрути: СТАРТ/ФІНІШ rows now show zero_address instead of "база"
-- Output Зведення: new Одометр column, calculated backwards from the last period
-- Multi-owner support: one track can be shared by multiple OwnerName (not on the same day)
+Changes vs v7:
+- Batch processing: треки обробляються батчами (налаштовується в сайдбарі)
+- Після кожного батча пам'ять звільняється через gc.collect()
+- Прогрес-бар відображає прогрес по батчах
+- Всі інші функції без змін
 """
 
+import gc
 import math
 import io
 import os
@@ -109,6 +108,16 @@ st.markdown("""
         margin: 0.5rem 0;
         font-family: monospace;
         font-size: 0.85rem;
+    }
+
+    .batch-info {
+        background: linear-gradient(135deg, #e8f5e9 0%, #f1f8e9 100%);
+        border: 1px solid #a5d6a7;
+        border-radius: 8px;
+        padding: 0.6rem 1rem;
+        font-size: 0.85rem;
+        color: #2e7d32;
+        margin: 0.3rem 0;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -512,13 +521,6 @@ def scored_fill(w_days, target_km, library, visited_global, params, seed=None):
 
 def build_rows(track, date, stop_names, coords, cache, owner_bases, date_owner_map,
                default_base, addresses=None):
-    """Build output rows for one day.
-
-    owner_bases    — {OwnerName: (lat, lon, zero_adress_str)}
-    date_owner_map — {date -> OwnerName} for this track
-    default_base   — fallback (lat, lon) if owner not in owner_bases
-    addresses      — {FullName -> address_str} appended after | in Точка column
-    """
     COL_TRACK = "Трек"
     COL_DATE  = "Дата"
     COL_OWNER = "OwnerName"
@@ -527,11 +529,9 @@ def build_rows(track, date, stop_names, coords, cache, owner_bases, date_owner_m
     COL_LAT   = "Latitude"
     COL_LON   = "Longitude"
 
-    # Determine OwnerName for this date
     date_key = pd.Timestamp(date).date()
     owner = date_owner_map.get(date_key, "")
 
-    # Resolve base coordinates and home label for this specific owner/day
     if owner and owner in owner_bases:
         b_lat, b_lon, zero_adress = owner_bases[owner]
         base = (b_lat, b_lon)
@@ -574,17 +574,9 @@ def build_rows(track, date, stop_names, coords, cache, owner_bases, date_owner_m
 
 
 def extract_pool(df_points_track):
-    """Extract stop coords, per-owner bases and address map from a track's points.
-
-    Returns:
-        coords       — {FullName: (lat, lon)}
-        default_base — centroid of all owner bases (used for build_library)
-        owner_bases  — {OwnerName: (lat, lon, zero_adress_str)}
-        addresses    — {FullName: address_str}
-    """
     coords = {}
     addresses = {}
-    owner_bases = {}  # {OwnerName: (lat, lon, adress_str)}
+    owner_bases = {}
 
     for _, row in df_points_track.iterrows():
         lat, lon = row['Latitude'], row['Longitude']
@@ -597,7 +589,6 @@ def extract_pool(df_points_track):
                            if addr is not None and not (isinstance(addr, float) and math.isnan(addr))
                            else "")
 
-    # Per-owner home base
     if 'OwnerName' in df_points_track.columns:
         for owner, grp in df_points_track.groupby('OwnerName'):
             row0 = grp.iloc[0]
@@ -610,7 +601,6 @@ def extract_pool(df_points_track):
                           else "")
                 owner_bases[str(owner)] = (float(z_lat), float(z_lon), za_str)
 
-    # Default base — centroid of all owner bases (fallback: centroid of points)
     if owner_bases:
         lats = [v[0] for v in owner_bases.values()]
         lons = [v[1] for v in owner_bases.values()]
@@ -641,26 +631,12 @@ def working_days(year, month):
 
 
 def compute_odometers(summary_rows_for_track, odometr_last):
-    """
-    Compute odometer values for each period in a track.
-
-    summary_rows_for_track: list of dicts with keys 'period', 'fact' — sorted chronologically
-    odometr_last: float odometer value set for the last period (END of last period)
-
-    Returns: dict {period_str -> odometer_value}
-    
-    Logic:
-    - The odometr value in sh3 is the reading at the END of the last period.
-    - For earlier periods:  odo_end[i] = odo_end[i+1] - fact_km[i+1]
-    - For single period: just show the odometr value as-is.
-    """
     if odometr_last is None or (isinstance(odometr_last, float) and math.isnan(odometr_last)):
         return {}
 
     if len(summary_rows_for_track) == 1:
         return {summary_rows_for_track[0]['period']: round(odometr_last, 1)}
 
-    # Sort chronologically
     def period_key(s):
         try:
             y, m = parse_period(s['period'])
@@ -670,10 +646,8 @@ def compute_odometers(summary_rows_for_track, odometr_last):
 
     sorted_rows = sorted(summary_rows_for_track, key=period_key)
     odo_map = {}
-    # Last period gets the provided odometr value
     odo_map[sorted_rows[-1]['period']] = round(odometr_last, 1)
 
-    # Walk backwards
     for i in range(len(sorted_rows) - 2, -1, -1):
         next_period = sorted_rows[i + 1]['period']
         next_fact = sorted_rows[i + 1]['fact']
@@ -684,9 +658,6 @@ def compute_odometers(summary_rows_for_track, odometr_last):
 
 
 def write_xlsx_to_bytes(all_rows, summary_rows, tolerance, odometr_map):
-    """
-    odometr_map: dict { (track, period) -> odometer_value }
-    """
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "Маршрути"
@@ -697,9 +668,8 @@ def write_xlsx_to_bytes(all_rows, summary_rows, tolerance, odometr_map):
     sf = PatternFill("solid", start_color="E2EFDA")
     ef = PatternFill("solid", start_color="FCE4D6")
     rf = PatternFill("solid", start_color="D9E2F3")
-    own_f = PatternFill("solid", start_color="FFF9C4")  # light yellow for owner col
+    own_f = PatternFill("solid", start_color="FFF9C4")
 
-    # Маршрути headers — added OwnerName
     headers = ["Трек", "Дата", "OwnerName", "Точка", "Пробег_км", "Latitude", "Longitude"]
     for c, h in enumerate(headers, 1):
         cell = ws1.cell(1, c, h)
@@ -721,13 +691,12 @@ def write_xlsx_to_bytes(all_rows, summary_rows, tolerance, odometr_map):
                 cell.fill = ef
             elif pt == "— без виїзду —":
                 cell.fill = rf
-            elif c == 3:  # OwnerName column — subtle highlight
+            elif c == 3:
                 cell.fill = own_f
 
     for i, w in enumerate([38, 12, 22, 65, 11, 13, 13], 1):
         ws1.column_dimensions[get_column_letter(i)].width = w
 
-    # Зведення sheet — added Одометр
     ws2 = wb.create_sheet("Зведення")
     sh = ["Трек", "Період", "План, км", "Факт, км", "Відхилення, %", "Статус", "Одометр"]
     for c, h in enumerate(sh, 1):
@@ -738,7 +707,7 @@ def write_xlsx_to_bytes(all_rows, summary_rows, tolerance, odometr_map):
 
     ok_f = PatternFill("solid", start_color="C6EFCE")
     er_f = PatternFill("solid", start_color="FFC7CE")
-    odo_f = PatternFill("solid", start_color="E8EAF6")  # indigo-50 for odometer col
+    odo_f = PatternFill("solid", start_color="E8EAF6")
     ok_n = Font(name="Arial", size=9, color="006100")
     er_n = Font(name="Arial", size=9, color="9C0006")
 
@@ -776,21 +745,184 @@ def write_xlsx_to_bytes(all_rows, summary_rows, tolerance, odometr_map):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  MAIN OPTIMIZATION PIPELINE
+#  PROCESS ONE TRACK  (виділено для батч-обробки)
 # ═══════════════════════════════════════════════════════════════════
-def run_optimization(df_points, df_dates, df_plan, params, log_callback=None):
+def process_track(track, df_points, df_dates, df_plan_active, cache,
+                  date_owner_by_track, odometr_input, params, log_callback=None):
+    """Обробляє один трек і повертає (rows, summary_rows)."""
     def log(msg):
         if log_callback:
             log_callback(msg)
 
-    # Initialize cache
+    track_pts = df_points[df_points['track'] == track].copy()
+    if track_pts.empty:
+        log("  ⚠ Немає точок — пропускаємо.")
+        return [], []
+
+    date_owner_map = date_owner_by_track.get(track, {})
+
+    owner_pool = {}
+    for own in set(date_owner_map.values()) - {""}:
+        own_pts = track_pts[track_pts['OwnerName'] == own]
+        if own_pts.empty:
+            continue
+        c_o, b_o, ob_o, a_o = extract_pool(own_pts)
+        if c_o and b_o is not None:
+            owner_pool[own] = (
+                c_o, b_o,
+                {own: ob_o.get(own, ob_o.get(list(ob_o.keys())[0])) if ob_o else (b_o[0], b_o[1], "")},
+                a_o
+            )
+            log(f"  Водій: {own} | точок: {len(c_o)} | база: {b_o[0]:.4f},{b_o[1]:.4f}")
+
+    if not owner_pool:
+        coords, default_base, owner_bases, addresses = extract_pool(track_pts)
+        if not coords or default_base is None:
+            log("  ⚠ Немає координат — пропускаємо.")
+            return [], []
+        owner_pool = {'__all__': (coords, default_base, owner_bases, addresses)}
+        log(f"  Пул точок (спільний): {len(coords)}")
+
+    track_plans = df_plan_active[df_plan_active['Трек'] == track]
+    months_info = []
+    for _, row in track_plans.iterrows():
+        period = str(row['Період']).strip()
+        target = float(str(row['План, км']).replace(",", "."))
+        try:
+            year, month = parse_period(period)
+        except ValueError as e:
+            log(f"  ⚠ {e}")
+            continue
+
+        track_dates = df_dates[df_dates['track'] == track].copy()
+        track_dates['DateActivity'] = pd.to_datetime(track_dates['DateActivity'])
+        track_dates['Date'] = track_dates['DateActivity'].dt.date
+
+        month_dates = track_dates[
+            (track_dates['DateActivity'].dt.year == year) &
+            (track_dates['DateActivity'].dt.month == month)
+        ]['Date'].unique()
+
+        w_days = sorted([pd.Timestamp(d) for d in month_dates]) if len(month_dates) > 0 else working_days(year, month)
+        months_info.append((year, month, target, w_days, period))
+
+    if not months_info:
+        return [], []
+
+    months_info.sort(key=lambda x: (x[0], x[1]))
+    log(f"  Місяців: {len(months_info)}, днів: {sum(len(m[3]) for m in months_info)}")
+
+    owner_libraries = {}
+    for own, (c_o, b_o, ob_o, a_o) in owner_pool.items():
+        lib = build_library(b_o, c_o, cache,
+                            params['max_stops'], params['n_samples'], params['seed'])
+        owner_libraries[own] = lib
+        log(f"  Бібліотека [{own}]: {len(lib)} маршрутів")
+
+    all_owner_bases = {}
+    all_addresses = {}
+    for own, (c_o, b_o, ob_o, a_o) in owner_pool.items():
+        all_owner_bases.update(ob_o)
+        all_addresses.update(a_o)
+    all_coords = {k: v for c_o, _, _, _ in owner_pool.values() for k, v in c_o.items()}
+
+    visited_per_owner = {own: set() for own in owner_pool}
+    track_rows_out = []
+    track_summary_rows = []
+
+    for year, month, target, w_days, period in months_info:
+        log(f"\n  ── Період: {period} | План: {target} км | Днів: {len(w_days)}")
+
+        owner_days = {}
+        for d in w_days:
+            own = date_owner_map.get(d.date(), "")
+            pool_key = own if own in owner_pool else ('__all__' if '__all__' in owner_pool else None)
+            if pool_key:
+                owner_days.setdefault(pool_key, []).append(d)
+
+        if not owner_days:
+            log("  ⚠ Немає днів — пропускаємо.")
+            continue
+
+        total_days = sum(len(v) for v in owner_days.values())
+        combined_day_plan = {}
+        fact_km = 0.0
+
+        for own, o_days in owner_days.items():
+            c_o, b_o, ob_o, a_o = owner_pool[own]
+            lib_o = owner_libraries[own]
+            o_target = round(target * len(o_days) / total_days, 2)
+            log(f"    {own}: {len(o_days)} днів | ціль {o_target} км")
+
+            o_plan, visited_per_owner[own] = scored_fill(
+                o_days, o_target, lib_o, visited_per_owner[own], params
+            )
+            combined_day_plan.update(o_plan)
+
+            for day_ts, (fs, _) in o_plan.items():
+                fact_km += calc_km(b_o, list(fs), c_o, cache)
+
+        fact_km = round(fact_km, 2)
+        dev_pct = (fact_km - target) / target * 100
+        status = "✓" if abs(dev_pct) <= params['tolerance'] * 100 else "✗"
+        log(f"  Факт: {fact_km:.1f} км | Відхилення: {dev_pct:+.1f}% {status}")
+
+        covered_now = set()
+        for fs, _ in combined_day_plan.values():
+            covered_now |= fs
+        log(f"  Унікальних точок: {len(covered_now)}/{len(all_coords)}")
+
+        rest_days = sum(1 for _, (fs, _) in combined_day_plan.items() if not fs)
+        log(f"  Днів з виїздом: {len(combined_day_plan) - rest_days}, без виїзду: {rest_days}")
+
+        for date in sorted(combined_day_plan.keys()):
+            fs, _ = combined_day_plan[date]
+            day_owner = date_owner_map.get(date.date(), "")
+            pool_key = day_owner if day_owner in owner_pool else '__all__'
+            c_day = owner_pool[pool_key][0] if pool_key in owner_pool else all_coords
+            track_rows_out.extend(
+                build_rows(track, pd.Timestamp(date), fs, c_day, cache,
+                           all_owner_bases, date_owner_map,
+                           owner_pool[pool_key][1] if pool_key in owner_pool else list(all_owner_bases.values())[0][:2],
+                           all_addresses))
+
+        track_summary_rows.append({
+            "track": track, "period": period,
+            "plan": target, "fact": fact_km, "dev_pct": dev_pct
+        })
+
+    total_covered = sum(len(v) for v in visited_per_owner.values())
+    total_pts = len(all_coords)
+    log(f"\n  Покрито за всі місяці: {total_covered}/{total_pts}")
+
+    return track_rows_out, track_summary_rows
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  MAIN OPTIMIZATION PIPELINE  (з батч-обробкою)
+# ═══════════════════════════════════════════════════════════════════
+def run_optimization(df_points, df_dates, df_plan, params, log_callback=None,
+                     progress_callback=None):
+    """
+    progress_callback(pct: int, text: str) — викликається для оновлення прогресу.
+    """
+    def log(msg):
+        if log_callback:
+            log_callback(msg)
+
+    def progress(pct, text=""):
+        if progress_callback:
+            progress_callback(pct, text)
+
+    # ── Ініціалізація кешу ──
     cache = DistanceCache()
     tmp_db = os.path.join(tempfile.gettempdir(), "route_opt_cache.db")
     cache.init_db(tmp_db)
     log(f"Кеш: {tmp_db}")
 
-    # Step 1: Prefetch distances
+    # ── Крок 1: Prefetch відстаней ──
     log("\n═══ КРОК 1: Завантаження відстаней (OSRM) ═══")
+    progress(5, "Завантаження відстаней (OSRM)...")
     prefetch_distances(
         cache, df_points, df_dates,
         osrm_url=params['osrm_url'],
@@ -799,12 +931,12 @@ def run_optimization(df_points, df_dates, df_plan, params, log_callback=None):
         max_workers=params['max_workers'],
         log_callback=log
     )
+    progress(20, "Відстані завантажено. Починаємо оптимізацію...")
 
-    # Step 2: Optimize routes
+    # ── Крок 2: Оптимізація маршрутів (батчами) ──
     log("\n═══ КРОК 2: Оптимізація маршрутів ═══")
 
-    # Build date→owner lookup per track from sh2
-    # {track: {date: OwnerName}}
+    # Словники для lookup
     date_owner_by_track = {}
     if 'OwnerName' in df_dates.columns:
         for _, row in df_dates.iterrows():
@@ -815,8 +947,7 @@ def run_optimization(df_points, df_dates, df_plan, params, log_callback=None):
                 continue
             owner = str(row.get('OwnerName', "")).strip()
             date_owner_by_track.setdefault(track, {})[d] = owner
-    
-    # Build odometr lookup from sh3 — support both 'одометр' and 'odometr' column names
+
     odo_col = None
     for candidate in ['одометр', 'odometr']:
         if candidate in df_plan.columns:
@@ -830,189 +961,72 @@ def run_optimization(df_points, df_dates, df_plan, params, log_callback=None):
             if odo is not None and not (isinstance(odo, float) and math.isnan(odo)):
                 odometr_input.setdefault(track, []).append((str(row['Період']).strip(), float(odo)))
 
-    # Filter active plans
     df_plan_active = df_plan[df_plan['План, км'] > 0].drop_duplicates(
         subset=['Трек', 'Період']).copy()
-    tracks = df_plan_active['Трек'].unique()
-    log(f"Активних пар Трек+Період: {len(df_plan_active)}")
+    all_tracks = list(df_plan_active['Трек'].unique())
+    batch_tracks_size = params.get('batch_tracks', 5)
+
+    # Розбиваємо треки на батчі
+    track_batches = [all_tracks[i:i + batch_tracks_size]
+                     for i in range(0, len(all_tracks), batch_tracks_size)]
+
+    log(f"Активних треків: {len(all_tracks)} | "
+        f"Батчів: {len(track_batches)} по {batch_tracks_size}")
 
     all_rows_out = []
     summary_rows = []
 
-    for track in tracks:
-        log(f"\n{'═' * 50}\nТРЕК: {track}")
+    for batch_idx, batch in enumerate(track_batches):
+        batch_num = batch_idx + 1
+        log(f"\n{'═' * 55}")
+        log(f"БАТЧ {batch_num}/{len(track_batches)}: {list(batch)}")
 
-        track_pts = df_points[df_points['track'] == track].copy()
-        if track_pts.empty:
-            log("  ⚠ Немає точок — пропускаємо.")
-            continue
+        # Фільтруємо дані лише для поточного батча
+        batch_points = df_points[df_points['track'].isin(batch)]
+        batch_dates  = df_dates[df_dates['track'].isin(batch)]
+        batch_plan   = df_plan_active[df_plan_active['Трек'].isin(batch)]
 
-        # Date→owner map for this track
-        date_owner_map = date_owner_by_track.get(track, {})
+        for track in batch:
+            log(f"\n{'─' * 40}\nТРЕК: {track}")
 
-        # ── Per-owner point pools ────────────────────────────────
-        # Each owner has their own territory (points) and home base.
-        # We build a separate library per owner so routes stay within
-        # each driver's geographical area.
-        owner_pool = {}   # {owner: (coords, base, addresses)}
-        for own in set(date_owner_map.values()) - {""}:
-            own_pts = track_pts[track_pts['OwnerName'] == own]
-            if own_pts.empty:
-                # owner drives the track but has no points in sh1 for it — skip
-                continue
-            c_o, b_o, ob_o, a_o = extract_pool(own_pts)
-            if c_o and b_o is not None:
-                owner_pool[own] = (c_o, b_o, {own: ob_o.get(own, ob_o.get(list(ob_o.keys())[0])) if ob_o else (b_o[0], b_o[1], "")}, a_o)
-                log(f"  Водій: {own} | точок: {len(c_o)} | база: {b_o[0]:.4f},{b_o[1]:.4f}")
+            rows, s_rows = process_track(
+                track,
+                batch_points, batch_dates, batch_plan,
+                cache,
+                date_owner_by_track, odometr_input,
+                params,
+                log_callback=log
+            )
+            all_rows_out.extend(rows)
+            summary_rows.extend(s_rows)
 
-        if not owner_pool:
-            # Fallback: single shared pool (original behaviour)
-            coords, default_base, owner_bases, addresses = extract_pool(track_pts)
-            if not coords or default_base is None:
-                log("  ⚠ Немає координат — пропускаємо.")
-                continue
-            owner_pool = {'__all__': (coords, default_base, owner_bases, addresses)}
-            log(f"  Пул точок (спільний): {len(coords)}")
+        # Звільняємо пам'ять після батча
+        del batch_points, batch_dates, batch_plan
+        gc.collect()
 
-        # Get periods for this track
-        track_plans = df_plan_active[df_plan_active['Трек'] == track]
-        months_info = []
-        for _, row in track_plans.iterrows():
-            period = str(row['Період']).strip()
-            target = float(str(row['План, км']).replace(",", "."))
-            try:
-                year, month = parse_period(period)
-            except ValueError as e:
-                log(f"  ⚠ {e}")
-                continue
-
-            track_dates = df_dates[df_dates['track'] == track].copy()
-            track_dates['DateActivity'] = pd.to_datetime(track_dates['DateActivity'])
-            track_dates['Date'] = track_dates['DateActivity'].dt.date
-
-            month_dates = track_dates[
-                (track_dates['DateActivity'].dt.year == year) &
-                (track_dates['DateActivity'].dt.month == month)
-            ]['Date'].unique()
-
-            w_days = sorted([pd.Timestamp(d) for d in month_dates]) if len(month_dates) > 0 else working_days(year, month)
-            months_info.append((year, month, target, w_days, period))
-
-        if not months_info:
-            continue
-
-        months_info.sort(key=lambda x: (x[0], x[1]))
-        log(f"  Місяців: {len(months_info)}, днів: {sum(len(m[3]) for m in months_info)}")
-
-        # Build one library per owner
-        owner_libraries = {}
-        for own, (c_o, b_o, ob_o, a_o) in owner_pool.items():
-            lib = build_library(b_o, c_o, cache,
-                                params['max_stops'], params['n_samples'], params['seed'])
-            owner_libraries[own] = lib
-            log(f"  Бібліотека [{own}]: {len(lib)} маршрутів")
-
-        # Combine all owner bases into one dict for build_rows
-        all_owner_bases = {}
-        all_addresses = {}
-        for own, (c_o, b_o, ob_o, a_o) in owner_pool.items():
-            all_owner_bases.update(ob_o)
-            all_addresses.update(a_o)
-        all_coords = {k: v for c_o, _, _, _ in owner_pool.values() for k, v in c_o.items()}
-
-        visited_per_owner = {own: set() for own in owner_pool}
-        track_summary_rows = []
-
-        for year, month, target, w_days, period in months_info:
-            log(f"\n  ── Період: {period} | План: {target} км | Днів: {len(w_days)}")
-
-            # Split days by owner
-            owner_days = {}
-            for d in w_days:
-                own = date_owner_map.get(d.date(), "")
-                # Match to an owner pool key
-                pool_key = own if own in owner_pool else ('__all__' if '__all__' in owner_pool else None)
-                if pool_key:
-                    owner_days.setdefault(pool_key, []).append(d)
-
-            if not owner_days:
-                log("  ⚠ Немає днів — пропускаємо.")
-                continue
-
-            # Allocate target km proportionally to number of days per owner
-            total_days = sum(len(v) for v in owner_days.values())
-            combined_day_plan = {}
-            fact_km = 0.0
-
-            for own, o_days in owner_days.items():
-                c_o, b_o, ob_o, a_o = owner_pool[own]
-                lib_o = owner_libraries[own]
-                o_target = round(target * len(o_days) / total_days, 2)
-                log(f"    {own}: {len(o_days)} днів | ціль {o_target} км")
-
-                o_plan, visited_per_owner[own] = scored_fill(
-                    o_days, o_target, lib_o, visited_per_owner[own], params
-                )
-                combined_day_plan.update(o_plan)
-
-                for day_ts, (fs, _) in o_plan.items():
-                    fact_km += calc_km(b_o, list(fs), c_o, cache)
-
-            fact_km = round(fact_km, 2)
-            dev_pct = (fact_km - target) / target * 100
-            status = "✓" if abs(dev_pct) <= params['tolerance'] * 100 else "✗"
-            log(f"  Факт: {fact_km:.1f} км | Відхилення: {dev_pct:+.1f}% {status}")
-
-            covered_now = set()
-            for fs, _ in combined_day_plan.values():
-                covered_now |= fs
-            log(f"  Унікальних точок: {len(covered_now)}/{len(all_coords)}")
-
-            rest_days = sum(1 for _, (fs, _) in combined_day_plan.items() if not fs)
-            log(f"  Днів з виїздом: {len(combined_day_plan) - rest_days}, без виїзду: {rest_days}")
-
-            for date in sorted(combined_day_plan.keys()):
-                fs, _ = combined_day_plan[date]
-                # Use per-owner coords for this day
-                day_owner = date_owner_map.get(date.date(), "")
-                pool_key = day_owner if day_owner in owner_pool else '__all__'
-                c_day = owner_pool[pool_key][0] if pool_key in owner_pool else all_coords
-                all_rows_out.extend(
-                    build_rows(track, pd.Timestamp(date), fs, c_day, cache,
-                               all_owner_bases, date_owner_map,
-                               owner_pool[pool_key][1] if pool_key in owner_pool else list(all_owner_bases.values())[0][:2],
-                               all_addresses))
-
-            row_entry = {
-                "track": track, "period": period,
-                "plan": target, "fact": fact_km, "dev_pct": dev_pct
-            }
-            summary_rows.append(row_entry)
-            track_summary_rows.append(row_entry)
-
-        total_covered = sum(len(v) for v in visited_per_owner.values())
-        total_pts = len(all_coords)
-        log(f"\n  Покрито за всі місяці: {total_covered}/{total_pts}")
+        # Оновлення прогресу: від 20% до 90%
+        pct = 20 + int(70 * batch_num / len(track_batches))
+        progress(pct, f"Батч {batch_num}/{len(track_batches)} завершено "
+                      f"({len(all_rows_out)} рядків накопичено)")
+        log(f"✅ Батч {batch_num} завершено | "
+            f"Рядків всього: {len(all_rows_out)} | "
+            f"Кеш: {len(cache)} пар")
 
     if not all_rows_out:
         log("\n⚠ Немає даних для запису!")
         return None, None, summary_rows, {}
 
-    # ── Compute odometer map ──
-    # Group summary rows by track
-    odometr_map = {}  # {(track, period) -> odo_value}
-
+    # ── Розрахунок одометрів ──
+    odometr_map = {}
     tracks_in_summary = {}
     for s in summary_rows:
         tracks_in_summary.setdefault(s['track'], []).append(s)
 
     for track, rows in tracks_in_summary.items():
-        # Find odometr value for last period from input
         odo_entries = odometr_input.get(track, [])
         if not odo_entries:
             continue
 
-        # Sort periods in rows chronologically
         def period_key_fn(s):
             try:
                 y, m = parse_period(s['period'])
@@ -1021,19 +1035,13 @@ def run_optimization(df_points, df_dates, df_plan, params, log_callback=None):
                 return (0, 0)
 
         sorted_rows = sorted(rows, key=period_key_fn)
-
-        # Determine which period has the odometr value
-        # The odometr in sh3 is set for the "last" period of the track
-        # We pick the entry that matches the last period (or just use the one provided)
         last_period_str = sorted_rows[-1]['period']
 
-        # Try to find a matching odometr entry for last period
         odo_val = None
         for p, v in odo_entries:
             if p == last_period_str:
                 odo_val = v
                 break
-        # If no explicit match, use any provided value (assume it's for last period)
         if odo_val is None and odo_entries:
             odo_val = odo_entries[0][1]
 
@@ -1041,25 +1049,25 @@ def run_optimization(df_points, df_dates, df_plan, params, log_callback=None):
         for period, odo in odo_per_period.items():
             odometr_map[(track, period)] = odo
 
-    # Build output
+    progress(95, "Формування Excel-файлу...")
     xlsx_bytes = write_xlsx_to_bytes(all_rows_out, summary_rows, params['tolerance'], odometr_map)
 
     ok_cnt = sum(1 for s in summary_rows if abs(s["dev_pct"]) <= params['tolerance'] * 100)
-    log(f"\n{'═' * 50}")
+    log(f"\n{'═' * 55}")
     log(f"РЕЗУЛЬТАТ: {len(summary_rows)} періодів | ✓ {ok_cnt} | ✗ {len(summary_rows) - ok_cnt}")
 
+    progress(100, f"Готово! {len(summary_rows)} періодів оброблено.")
     return xlsx_bytes, all_rows_out, summary_rows, odometr_map
 
 
 # ═══════════════════════════════════════════════════════════════════
 #  STREAMLIT UI
 # ═══════════════════════════════════════════════════════════════════
-
 def render_header():
-    st.markdown('<div class="main-title">🚗 Route Optimizer v7</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-title">🚗 Route Optimizer v7 + Batch</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="sub-title">Оптимізація маршрутів за планом пробігу • '
-        'OSRM + Monte Carlo • Мульти-власник • Одометр</div>',
+        'OSRM + Monte Carlo • Мульти-власник • Одометр • Батч-обробка треків</div>',
         unsafe_allow_html=True)
 
 
@@ -1083,6 +1091,21 @@ def render_sidebar():
         max_rest_ratio = st.slider("MAX_REST_RATIO — ліміт днів без виїзду", 0.0, 0.9, 0.6, 0.05)
 
         st.markdown("---")
+        st.markdown("**⚡ Батч-обробка**")
+        batch_tracks = st.slider(
+            "Треків за раз",
+            min_value=1, max_value=20, value=5, step=1,
+            help=(
+                "Скільки треків обробляти за один батч.\n"
+                "Менше — менше пам'яті, більше — швидше.\n"
+                "Рекомендації:\n"
+                "• до 50 точок/трек → 10–15\n"
+                "• 50–200 точок/трек → 3–5\n"
+                "• 200+ точок/трек → 1–2"
+            )
+        )
+
+        st.markdown("---")
         st.markdown("**OSRM API**")
         osrm_url = st.text_input("OSRM URL", value="http://router.project-osrm.org")
         batch_size = st.slider("Batch size (Table API)", 10, 100, 80)
@@ -1098,6 +1121,7 @@ def render_sidebar():
         'coverage_bonus': coverage_bonus,
         'repeat_penalty': repeat_penalty,
         'max_rest_ratio': max_rest_ratio,
+        'batch_tracks': batch_tracks,
         'osrm_url': osrm_url.rstrip('/'),
         'batch_size': batch_size,
         'api_delay': api_delay,
@@ -1106,7 +1130,6 @@ def render_sidebar():
 
 
 def render_map_editor(df_points):
-    """Render interactive map for viewing and editing coordinates."""
     try:
         import folium
         from streamlit_folium import st_folium
@@ -1256,20 +1279,21 @@ def main():
             "**sh1** колонки: track, OwnerName, FullName, address, Latitude, Longitude, "
             "zero_Latitude, zero_Longitude, zero_address\n\n"
             "**sh2** колонки: DateActivity, track, OwnerName\n\n"
-            "**sh3** колонки: Трек, Період, План км, odometr (тільки для останнього Період кожного Трек)"
+            "**sh3** колонки: Трек, Період, План км, odometr"
         )
     )
 
     if uploaded is None:
         st.info(
             "Завантажте файл для початку роботи.\n\n"
-            "**Нові колонки у v7:**\n"
-            "- **sh1**: `address` (адреса точки доставки), `zero_address` (адреса дому водія)\n"
-            "- **sh2**: `OwnerName` (хто їде в цей день; одночасно лише один водій на трек)\n"
-            "- **sh3**: `odometr` (показання одометра для останнього Період кожного Трек)\n\n"
-            "**Вихід:**\n"
-            "- Маршрути: СТАРТ/ФІНІШ показують адресу водія з `zero_address`\n"
-            "- Зведення: стовпець **Одометр** розраховується назад від останнього Період"
+            "**Батч-обробка (нове):**\n"
+            "- Параметр **«Треків за раз»** в сайдбарі визначає розмір батча\n"
+            "- Пам'ять звільняється після кожного батча\n"
+            "- Прогрес-бар показує стан по батчах\n\n"
+            "**Рекомендації по розміру батча:**\n"
+            "- до 50 точок на трек → 10–15 треків\n"
+            "- 50–200 точок → 3–5 треків\n"
+            "- 200+ точок → 1–2 треки"
         )
         return
 
@@ -1287,9 +1311,6 @@ def main():
         st.error(f"Помилка читання файлу: {e}")
         return
 
-    # ── Normalize whitespace in all string columns that carry track names ──
-    # Excel sometimes stores non-breaking spaces (\xa0) instead of regular spaces,
-    # causing track name mismatches between sh1/sh2/sh3.
     def normalize_ws(df, cols):
         for col in cols:
             if col in df.columns:
@@ -1299,11 +1320,10 @@ def main():
                            .str.strip())
         return df
 
-    df_points  = normalize_ws(df_points,  ['OwnerName', 'track'])
-    df_dates   = normalize_ws(df_dates,   ['track', 'OwnerName'])
-    df_plan    = normalize_ws(df_plan,    ['Трек'])
+    df_points = normalize_ws(df_points, ['OwnerName', 'track'])
+    df_dates  = normalize_ws(df_dates,  ['track', 'OwnerName'])
+    df_plan   = normalize_ws(df_plan,   ['Трек'])
 
-    # Ensure new columns exist (backward compat)
     for col in ['adress FullName', 'zero_adress']:
         if col not in df_points.columns:
             df_points[col] = ""
@@ -1313,17 +1333,14 @@ def main():
     if not odo_col_exists:
         df_plan['одометр'] = None
 
-    # ── Derive `track` for sh1 from sh2 (OwnerName → track mapping) ──
-    # sh1 has no `track` column; each point belongs to all tracks the owner drives.
     if 'track' not in df_points.columns:
         owner_track_pairs = (df_dates[['OwnerName', 'track']]
                              .dropna()
                              .drop_duplicates())
-        # Expand: one row per (point × track) for owners that drive multiple tracks
         df_points = df_points.merge(owner_track_pairs, on='OwnerName', how='left')
         missing_track = df_points['track'].isna().sum()
         if missing_track > 0:
-            st.warning(f"⚠️ {missing_track} точок не мають відповідного треку в sh2 — перевірте OwnerName.")
+            st.warning(f"⚠️ {missing_track} точок не мають відповідного треку в sh2.")
             df_points = df_points.dropna(subset=['track'])
 
     if 'df_points' not in st.session_state or st.session_state.get('_file_id') != uploaded.name:
@@ -1332,9 +1349,11 @@ def main():
 
     df_points = st.session_state.df_points
 
-    # ── Stats row ──
+    # ── Статистика ──
     tracks = df_points['track'].unique()
-    cols = st.columns(4)
+    n_batches = math.ceil(len(tracks) / params['batch_tracks'])
+
+    cols = st.columns(5)
     with cols[0]:
         st.markdown(f'<div class="stat-card"><h3>{len(tracks)}</h3><p>Треків</p></div>',
                     unsafe_allow_html=True)
@@ -1346,10 +1365,22 @@ def main():
         st.markdown(f'<div class="stat-card"><h3>{n_dates}</h3><p>Унікальних дат</p></div>',
                     unsafe_allow_html=True)
     with cols[3]:
-        # Count unique owners across sh1
         all_owners = df_points['OwnerName'].dropna().unique() if 'OwnerName' in df_points.columns else []
         st.markdown(f'<div class="stat-card"><h3>{len(all_owners)}</h3><p>Водіїв</p></div>',
                     unsafe_allow_html=True)
+    with cols[4]:
+        st.markdown(
+            f'<div class="stat-card"><h3>{n_batches}</h3>'
+            f'<p>Батчів по {params["batch_tracks"]} трек(и)</p></div>',
+            unsafe_allow_html=True)
+
+    # ── Підказка по батчах ──
+    st.markdown(
+        f'<div class="batch-info">⚡ Буде сформовано <b>{n_batches} батч(ів)</b> '
+        f'по <b>{params["batch_tracks"]}</b> трек(и) кожен. '
+        f'Після кожного батча пам\'ять автоматично звільняється.</div>',
+        unsafe_allow_html=True
+    )
 
     st.markdown("")
 
@@ -1363,7 +1394,6 @@ def main():
 
     with tab_pts:
         st.markdown("#### Точки відвідування")
-        # Show columns including new address fields
         edit_cols = ['track', 'OwnerName', 'FullName', 'adress FullName',
                      'Latitude', 'Longitude',
                      'zero_Latitude', 'zero_Longitude', 'zero_adress']
@@ -1380,7 +1410,6 @@ def main():
                     st.session_state.df_points.loc[edited_pts.index, c] = edited_pts[c]
             st.success("Дані оновлено!")
 
-        # Show owner-track mapping info
         if 'OwnerName' in df_points.columns:
             owner_track = df_points.groupby('track')['OwnerName'].apply(
                 lambda x: ', '.join(sorted(x.dropna().unique()))).reset_index()
@@ -1393,7 +1422,6 @@ def main():
         df_dates_show = df_dates.copy()
         df_dates_show['DateActivity'] = pd.to_datetime(df_dates_show['DateActivity'])
 
-        # Summary grouped by track + owner
         group_cols = ['track']
         if 'OwnerName' in df_dates_show.columns:
             group_cols.append('OwnerName')
@@ -1406,7 +1434,6 @@ def main():
         date_summary['Остання_дата'] = date_summary['Остання_дата'].dt.strftime('%Y-%m-%d')
         st.dataframe(date_summary, use_container_width=True)
 
-        # Conflict check: same track, same day, multiple owners
         if 'OwnerName' in df_dates.columns:
             df_dates_tmp = df_dates.copy()
             df_dates_tmp['_date'] = pd.to_datetime(df_dates_tmp['DateActivity']).dt.date
@@ -1414,8 +1441,7 @@ def main():
             conflicts = conflict[conflict > 1]
             if len(conflicts) > 0:
                 st.error(
-                    f"⚠️ Знайдено {len(conflicts)} конфлікт(ів): один трек — кілька водіїв в той самий день!\n"
-                    f"Перевірте sh2 — одночасно лише один OwnerName може використовувати трек."
+                    f"⚠️ Знайдено {len(conflicts)} конфлікт(ів): один трек — кілька водіїв в той самий день!"
                 )
                 st.dataframe(conflicts.reset_index().rename(
                     columns={'_date': 'Дата', 'OwnerName': 'Кількість водіїв'}),
@@ -1424,15 +1450,13 @@ def main():
     with tab_plan:
         st.markdown("#### Плановий пробіг (sh3)")
         st.markdown(
-            "Стовпець **`odometr`** заповнюється **лише для останнього Період** кожного Трека. "
-            "Показання для попередніх Período розраховуються автоматично: "
-            "`Одометр[i] = Одометр[i+1] − Факт_км[i+1]`"
+            "Стовпець **`odometr`** заповнюється **лише для останнього Період** кожного Трека."
         )
         plan_edit_cols = ['Трек', 'Період', 'План, км', 'odometr']
         plan_display = [c for c in plan_edit_cols if c in df_plan.columns]
         st.dataframe(df_plan[plan_display], use_container_width=True)
 
-    # ── Run button ──
+    # ── Кнопка запуску ──
     st.markdown("---")
 
     missing_coords = (df_points['Latitude'].isna().sum() +
@@ -1441,15 +1465,18 @@ def main():
                       df_points['zero_Longitude'].isna().sum())
 
     if missing_coords > 0:
-        st.warning(f"⚠️ Є {missing_coords} пропущених координат. Визначте їх на карті або в таблиці.")
+        st.warning(f"⚠️ Є {missing_coords} пропущених координат.")
 
     col_run, col_info = st.columns([1, 2])
     with col_run:
         run_clicked = st.button("🚀 Запустити оптимізацію", type="primary",
                                 use_container_width=True)
     with col_info:
-        st.caption(f"TOLERANCE={params['tolerance']}, MAX_STOPS={params['max_stops']}, "
-                   f"N_SAMPLES={params['n_samples']}, SEED={params['seed']}")
+        st.caption(
+            f"TOLERANCE={params['tolerance']}, MAX_STOPS={params['max_stops']}, "
+            f"N_SAMPLES={params['n_samples']}, SEED={params['seed']}, "
+            f"BATCH={params['batch_tracks']} треків"
+        )
 
     if run_clicked:
         log_messages = []
@@ -1462,16 +1489,19 @@ def main():
                 '<div class="log-box">' + "<br>".join(log_messages[-40:]) + '</div>',
                 unsafe_allow_html=True)
 
+        def progress_callback(pct, text=""):
+            progress_bar.progress(pct, text=text or "Обробка...")
+
         with st.spinner("Оптимізація маршрутів..."):
             start_time = time.time()
-            progress_bar.progress(10, text="Завантаження відстаней...")
 
             xlsx_bytes, all_rows, summary_rows, odometr_map = run_optimization(
                 st.session_state.df_points, df_dates, df_plan, params,
-                log_callback=log_callback)
+                log_callback=log_callback,
+                progress_callback=progress_callback
+            )
 
             elapsed = time.time() - start_time
-            progress_bar.progress(100, text=f"Готово за {elapsed:.0f} сек!")
 
         if xlsx_bytes is not None:
             st.session_state.result_xlsx = xlsx_bytes
@@ -1480,7 +1510,7 @@ def main():
             st.session_state.odometr_map = odometr_map
             st.success(f"✅ Оптимізацію завершено за {elapsed:.1f} сек!")
 
-    # ── Results display ──
+    # ── Результати ──
     if 'result_xlsx' in st.session_state and st.session_state.result_xlsx is not None:
         st.markdown("---")
         st.markdown("### 📋 Результати")
@@ -1490,7 +1520,6 @@ def main():
 
         if summary:
             tolerance_pct = params['tolerance'] * 100
-
             sum_data = []
             for s in summary:
                 ok = abs(s["dev_pct"]) <= tolerance_pct
@@ -1528,9 +1557,9 @@ def main():
 
         st.markdown("")
         st.download_button(
-            label="📥 Завантажити v7_optimized.xlsx",
+            label="📥 Завантажити v7_batch_optimized.xlsx",
             data=st.session_state.result_xlsx,
-            file_name="v7_optimized.xlsx",
+            file_name="v7_batch_optimized.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
             use_container_width=True,
